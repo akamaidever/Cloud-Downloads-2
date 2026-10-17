@@ -1,0 +1,555 @@
+# OctoFetch-YouTubeDrive-Version: 18
+
+name: 'YouTube → Drive Engine'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube video URL'
+        required: true
+        type: string
+      folder_name:
+        description: 'Folder identifier used for the links manifest path'
+        required: true
+        type: string
+      output_format:
+        description: 'mp4 or mp3'
+        required: false
+        type: string
+        default: 'mp4'
+      desired_quality:
+        description: 'Video quality (720p, 1080p) or audio bitrate (128kbps, 192kbps, 320kbps)'
+        required: false
+        type: string
+        default: '720p'
+      drive_category:
+        description: 'Sub-folder created under OctoFetch/ on Google Drive'
+        required: false
+        type: string
+        default: 'YouTube'
+      cookies:
+        description: 'Optional YouTube cookies in Netscape format, base64-encoded. Only needed for age-restricted, members-only or region-locked videos.'
+        required: false
+        type: string
+        default: ''
+      max_mb:
+        description: 'Refuse videos larger than this many MB. 0 means no limit.'
+        required: false
+        type: string
+        default: '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yt-drive-${{ github.event.inputs.folder_name }}
+  cancel-in-progress: false
+
+jobs:
+  youtube-drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+
+      - name: Checkout (sparse, fast)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+          sparse-checkout-cone-mode: false
+
+      - name: Start PO-Token Provider (Docker)
+        run: |
+          docker run --name bgutil-provider -d --restart always -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:4416/ping >/dev/null 2>&1; then
+              echo "PO-Token Provider is ready."
+              break
+            fi
+            echo "Waiting for PO-Token Provider..."
+            sleep 1
+          done
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zip curl python3 python3-pip ffmpeg
+          pip3 install --quiet -U "yt-dlp[default]" yt-dlp-ejs bgutil-ytdlp-pot-provider google-api-python-client google-auth google-auth-httplib2
+
+      - name: Install Deno Runtime
+        run: |
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      - name: Verify YouTube tools
+        run: |
+          set -e
+          export PATH="$HOME/.deno/bin:$PATH"
+          ffmpeg -version | head -n 1
+          deno --version || true
+          python3 -m yt_dlp --version
+          python3 -c "import yt_dlp; print('yt_dlp import ok')"
+          curl -s http://127.0.0.1:4416/ping || echo "Warning: POT provider ping failed"
+
+      - name: Download video
+        env:
+          INPUT_URL: ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT: ${{ github.event.inputs.output_format }}
+          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
+          INPUT_COOKIES: ${{ github.event.inputs.cookies }}
+          INPUT_MAX_MB: ${{ github.event.inputs.max_mb }}
+        run: |
+          python3 << 'EOF'
+          """Downloads a YouTube video using pure yt-dlp with PO-Token Provider.
+
+          Writes .download_info with:
+              line 1: the absolute path of the downloaded file
+              line 2: the file name
+              line 3: the title
+          """
+
+          import base64
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import time
+
+          URL = os.environ.get("INPUT_URL", "").strip()
+          FMT = os.environ.get("INPUT_FORMAT", "mp4").strip().lower()
+          QUALITY = os.environ.get("INPUT_QUALITY", "720p").strip().lower()
+          COOKIES_B64 = os.environ.get("INPUT_COOKIES", "").strip()
+          CHUNK_LIMIT_MB = int(os.environ.get("INPUT_MAX_MB", "0") or 0)
+
+          cookies_file = None
+          clean_cookie_file = None
+          stripped_cookie_file = None
+
+          def die(message, detail=""):
+              for cf in (cookies_file, clean_cookie_file, stripped_cookie_file):
+                  if cf and os.path.exists(cf):
+                      try:
+                          os.remove(cf)
+                      except OSError:
+                          pass
+              print("Cleaned up temporary cookie files.")
+              if detail:
+                  print(f"::error::{message}")
+                  print(detail)
+              else:
+                  print(f"::error::{message}")
+              sys.exit(1)
+
+          def quality_height(raw):
+              m = re.search(r"(\d{3,4})", raw or "")
+              if not m:
+                  return 720
+              value = int(m.group(1))
+              for floor in (2160, 1440, 1080, 720, 480, 360, 240, 144):
+                  if value >= floor:
+                      return floor
+              return 144
+
+          def sanitize_cookie_file(src_path, dst_path, strip_rolling=False):
+              if not src_path or not os.path.exists(src_path):
+                  return False
+              with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
+                  lines = fh.readlines()
+              out_lines = [
+                  "# Netscape HTTP Cookie File\n",
+                  "# https://curl.haxx.se/rfc/cookie_spec.html\n",
+                  "# This is a generated file! Do not edit.\n\n"
+              ]
+              kept = 0
+              for line in lines:
+                  s = line.strip()
+                  if not s or s.startswith("# Netscape") or s.startswith("# http") or s.startswith("# This is"):
+                      continue
+                  if s.startswith("#") and not s.startswith("#HttpOnly_"):
+                      continue
+                  parts = s.split("\t")
+                  if len(parts) < 7:
+                      parts = re.split(r"\s+", s)
+                  if len(parts) >= 7:
+                      cname = parts[5].strip()
+                      # If strip_rolling is True, eliminate volatile session tokens (*PSIDTS, *SIDCC)
+                      if strip_rolling and any(k in cname for k in ("PSIDTS", "SIDCC")):
+                          continue
+                      cleaned_row = "\t".join([p.strip() for p in parts[:6]] + ["\t".join(parts[6:]).strip()])
+                      out_lines.append(cleaned_row + "\n")
+                      kept += 1
+              if kept > 0:
+                  with open(dst_path, "w", encoding="utf-8", newline="\n") as fh:
+                      fh.writelines(out_lines)
+                  os.chmod(dst_path, 0o600)
+                  return True
+              return False
+
+          if COOKIES_B64:
+              try:
+                  raw = base64.b64decode(COOKIES_B64, validate=True).decode("utf-8")
+                  cookies_file = os.path.join(os.getcwd(), "yt_cookies.txt")
+                  with open(cookies_file, "w", encoding="utf-8", newline="\n") as fh:
+                      fh.write(raw if raw.endswith("\n") else raw + "\n")
+                  os.chmod(cookies_file, 0o600)
+                  clean_cookie_file = os.path.join(os.getcwd(), "yt_cookies_clean.txt")
+                  if sanitize_cookie_file(cookies_file, clean_cookie_file, strip_rolling=False):
+                      print("Validated and formatted YouTube cookies.")
+                  else:
+                      clean_cookie_file = cookies_file
+                      print("Using raw YouTube cookies.")
+              except Exception as exc:
+                  print(f"::warning::Cookies decode warning: {exc}")
+          else:
+              print("No YouTube cookies supplied via INPUT_COOKIES.")
+
+          if not URL:
+              die("No video URL was supplied.")
+
+          is_audio = FMT in ("mp3", "m4a", "opus", "wav")
+          height = quality_height(QUALITY)
+          final_ext = "mp3" if FMT == "mp3" else ("m4a" if is_audio else "mp4")
+
+          video_id = "video"
+          m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{11})", URL)
+          if m:
+              video_id = m.group(1)
+
+          print(f"Fetching: {URL}")
+          print(f"Format  : {'audio (' + final_ext + ')' if is_audio else 'video up to ' + str(height) + 'p'}")
+
+          if is_audio:
+              if FMT == "mp3":
+                  selector = "bestaudio/best"
+                  postprocess = ["--extract-audio", "--audio-format", "mp3"]
+              else:
+                  selector = f"bestaudio[ext={FMT}]/bestaudio/best"
+                  postprocess = []
+          else:
+              selector = (
+                  f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                  f"bestvideo[height<={height}]+bestaudio/"
+                  f"best[height<={height}]/"
+                  f"best"
+              )
+              postprocess = ["--merge-output-format", "mp4"]
+
+          def run_ytdlp(client_list, cookie_path=None):
+              c = [
+                  sys.executable, "-m", "yt_dlp",
+                  "--no-playlist",
+                  "--newline",
+                  "--retries", "5",
+                  "--fragment-retries", "5",
+                  "--socket-timeout", "30",
+                  "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+                  "--extractor-args", f"youtube:player_client={client_list}",
+                  "-f", selector,
+                  "-o", "download.%(ext)s",
+              ]
+              deno_bin = shutil.which("deno") or os.path.expanduser("~/.deno/bin/deno")
+              if isinstance(deno_bin, str) and os.path.exists(deno_bin):
+                  c += ["--js-runtimes", f"deno:{deno_bin}"]
+              else:
+                  c += ["--js-runtimes", "deno"]
+              c += ["--js-runtimes", "node", "--remote-components", "ejs:github"]
+              if cookie_path and os.path.exists(cookie_path):
+                  c += ["--cookies", cookie_path]
+              if postprocess:
+                  c += postprocess
+              c.append(URL)
+              res = subprocess.run(c, capture_output=True, text=True, encoding="utf-8", errors="replace")
+              if res.returncode != 0 and not has_downloaded():
+                  err_tail = "\n".join((res.stderr or "").splitlines()[-10:])
+                  out_tail = "\n".join((res.stdout or "").splitlines()[-10:])
+                  print(f"::warning::Client [{client_list}] (cookies={bool(cookie_path)}) failed (exit {res.returncode}):\n{err_tail}\n{out_tail}")
+              return res
+
+          def has_downloaded():
+              return any(
+                  f.startswith("download.") and os.path.getsize(f) > 0
+                  for f in os.listdir(".")
+              )
+
+          proc = None
+          # Strategy 1: Attempt with user cookies (web_embedded is proven to work without GVS PO-Token block)
+          if clean_cookie_file and os.path.exists(clean_cookie_file):
+              print("Attempting download with cookies (web_embedded, web_creator, mweb)...")
+              proc = run_ytdlp("web_embedded,web_creator,mweb", cookie_path=clean_cookie_file)
+              if proc.returncode != 0 and not has_downloaded():
+                  print("Retrying with cookies (android, ios)...")
+                  proc = run_ytdlp("android,ios", cookie_path=clean_cookie_file)
+
+              # Strategy 1b: If cookies failed due to rotation or challenge, auto-strip volatile tokens
+              if proc.returncode != 0 and not has_downloaded():
+                  stripped_cookie_file = os.path.join(os.getcwd(), "yt_cookies_stripped.txt")
+                  if sanitize_cookie_file(cookies_file, stripped_cookie_file, strip_rolling=True):
+                      print("Detected possible expired rolling tokens. Retrying with auto-repaired cookies...")
+                      proc = run_ytdlp("web_embedded,web_creator,mweb", cookie_path=stripped_cookie_file)
+                      if proc.returncode != 0 and not has_downloaded():
+                          proc = run_ytdlp("android,ios", cookie_path=stripped_cookie_file)
+
+          # Strategy 2: If cookies failed or weren't provided, seamlessly fallback to anonymous PO-Token
+          if (not proc or proc.returncode != 0) and not has_downloaded():
+              print("Cookie session challenged or no cookies. Running yt-dlp with PO-Token (web_embedded, web_creator)...")
+              proc = run_ytdlp("web_embedded,web_creator,mweb", cookie_path=None)
+
+          if (not proc or proc.returncode != 0) and not has_downloaded():
+              print("Retrying yt-dlp with PO-Token (android, ios)...")
+              proc = run_ytdlp("android,ios", cookie_path=None)
+
+          if (not proc or proc.returncode != 0) and not has_downloaded():
+              print("Retrying yt-dlp with PO-Token (tv, tv_embedded)...")
+              proc = run_ytdlp("tv,tv_embedded", cookie_path=None)
+
+          candidates = [
+              os.path.join(".", f) for f in os.listdir(".")
+              if f.startswith("download.") and os.path.getsize(f) > 0
+          ]
+          if not candidates:
+              err = (proc.stderr or "").strip() if proc else "No output from downloader"
+              tail = "\n".join(err.splitlines()[-14:])
+              if "Sign in to confirm you" in err or "confirm you are not a bot" in err:
+                  die("YouTube asked to confirm you are not a bot (HTTP 403).", tail)
+              if "Private video" in err:
+                  die("This video is private.", tail)
+              if "members-only" in err.lower() or "join this channel" in err.lower():
+                  die("This video is members-only. Supply valid YouTube cookies in Settings.", tail)
+              if "age-restricted" in err.lower() or "confirm your age" in err.lower():
+                  die("This video is age-restricted. Supply valid YouTube cookies in Settings.", tail)
+              if "403" in err:
+                  die("YouTube refused to serve the video stream (HTTP 403).", tail)
+              die("Downloader could not fetch this video.", tail)
+
+          path = max(candidates, key=os.path.getsize)
+          size_mb = os.path.getsize(path) / 1048576
+
+          if size_mb < 0.01:
+              die(f"The downloaded file is empty ({path}).")
+
+          if CHUNK_LIMIT_MB and size_mb > CHUNK_LIMIT_MB:
+              die(
+                  f"The video is {size_mb:.0f} MB, over the {CHUNK_LIMIT_MB} MB limit this "
+                  f"server allows. Choose a lower quality."
+              )
+
+          title = ""
+          try:
+              probe = subprocess.run(
+                  [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings",
+                   "--js-runtimes", "deno", "--js-runtimes", "node", "--remote-components", "ejs:github",
+                   "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+                   "--extractor-args", "youtube:player_client=web_embedded,web_creator,mweb",
+                   "--skip-download", "--print", "%(title)s", URL],
+                  capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+              if probe.returncode == 0 and probe.stdout.strip():
+                  title = probe.stdout.strip().splitlines()[0]
+          except Exception:
+              pass
+
+          if not title:
+              title = os.path.splitext(os.path.basename(path))[0]
+
+          suffix = f"{height}p" if not is_audio else final_ext
+          clean = re.sub(r"[^A-Za-z0-9\-_()\[\]]", "_", title.replace(" ", "_"))
+          clean = re.sub(r"_+", "_", clean).strip("_")[:70] or video_id
+          clean = clean.lstrip("-")
+          filename = f"{clean}_{video_id}_{suffix}.{final_ext}"
+
+          if os.path.exists(filename):
+              os.remove(filename)
+          os.rename(path, filename)
+          final = os.path.abspath(filename)
+
+          print(f"Downloaded: {filename} ({size_mb:.1f} MB)")
+
+          with open(".download_info", "w", encoding="utf-8") as fh:
+              fh.write(f"{final}\n{filename}\n{title}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"filename={filename}\n")
+              fh.write(f"title={title}\n")
+
+          for tmp_c in [cookies_file, clean_cookie_file, os.path.join(os.getcwd(), "yt_cookies_stripped.txt")]:
+              if tmp_c and os.path.exists(tmp_c):
+                  try:
+                      os.remove(tmp_c)
+                  except OSError:
+                      pass
+          print("Cleaned up temporary cookie files.")
+          EOF
+
+      - name: Stage the file
+        run: |
+          set -euo pipefail
+          # .download_info holds: absolute path, file name, title.
+          FILE_PATH=$(head -1 .download_info)
+          FILENAME=$(sed -n '2p' .download_info)
+          if [ ! -s "$FILE_PATH" ]; then
+            echo "::error::Downloaded file is missing or empty: $FILE_PATH"
+            exit 1
+          fi
+          mkdir -p source_file
+          mv "$FILE_PATH" "source_file/$FILENAME"
+
+      - name: Compute folder identifier
+        env:
+          FOLDER_INPUT: ${{ github.event.inputs.folder_name }}
+        run: |
+          set -euo pipefail
+          FOLDER=$(printf '%s' "$FOLDER_INPUT" | tr -c 'A-Za-z0-9._-' '_')
+          [ ${#FOLDER} -gt 100 ] && FOLDER="${FOLDER:0:100}"
+          [ -z "$FOLDER" ] && FOLDER="YT_$(date +%Y%m%d%H%M%S)"
+          echo "FOLDER=$FOLDER" >> "$GITHUB_ENV"
+
+      - name: Upload to Google Drive
+        env:
+          DRIVE_REFRESH_TOKEN: ${{ secrets.OCTOFETCH_DRIVE_REFRESH_TOKEN }}
+          DRIVE_CLIENT_ID: ${{ secrets.OCTOFETCH_DRIVE_CLIENT_ID }}
+          DRIVE_CLIENT_SECRET: ${{ secrets.OCTOFETCH_DRIVE_CLIENT_SECRET }}
+          DRIVE_CATEGORY: ${{ github.event.inputs.drive_category }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DRIVE_REFRESH_TOKEN:-}" ] || [ -z "${DRIVE_CLIENT_ID:-}" ] || [ -z "${DRIVE_CLIENT_SECRET:-}" ]; then
+            echo "::error::Drive credentials missing. Re-connect Google Drive in the OctoFetch desktop app."
+            exit 1
+          fi
+
+          python3 << 'PY'
+          import os, sys, json, mimetypes
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+          from google.oauth2.credentials import Credentials
+
+          creds = Credentials(
+              None,
+              refresh_token=os.environ['DRIVE_REFRESH_TOKEN'],
+              client_id=os.environ['DRIVE_CLIENT_ID'],
+              client_secret=os.environ['DRIVE_CLIENT_SECRET'],
+              token_uri='https://oauth2.googleapis.com/token',
+              scopes=['https://www.googleapis.com/auth/drive.file'],
+          )
+          drive = build('drive', 'v3', credentials=creds, cache_discovery=False)
+
+          category = (os.environ.get('DRIVE_CATEGORY') or 'YouTube').strip() or 'YouTube'
+          folder = os.environ['FOLDER']
+          source_dir = 'source_file'
+
+          def escape(name):
+              return name.replace("\\", "\\\\").replace("'", "\\'")
+
+          def find_or_create_folder(name, parent_id):
+              parent_clause = (f"and '{parent_id}' in parents"
+                               if parent_id else "and 'root' in parents")
+              q = ("mimeType = 'application/vnd.google-apps.folder' "
+                   "and trashed = false "
+                   f"and name = '{escape(name)}' {parent_clause}")
+              resp = drive.files().list(
+                  q=q, spaces='drive',
+                  fields='files(id, name)',
+                  pageSize=10
+              ).execute()
+              files = resp.get('files', [])
+              if files:
+                  return files[0]['id']
+              meta = {'name': name, 'mimeType': 'application/vnd.google-apps.folder'}
+              if parent_id:
+                  meta['parents'] = [parent_id]
+              created = drive.files().create(body=meta, fields='id').execute()
+              return created['id']
+
+          root_id = find_or_create_folder('OctoFetch', None)
+          target_id = find_or_create_folder(category, root_id)
+
+          uploads = sorted(os.listdir(source_dir)) if os.path.isdir(source_dir) else []
+          if not uploads:
+              print('::error::source_file/ is empty after download.', file=sys.stderr)
+              sys.exit(1)
+
+          results = []
+          for fname in uploads:
+              path = os.path.join(source_dir, fname)
+              mime, _ = mimetypes.guess_type(fname)
+              media = MediaFileUpload(
+                  path,
+                  mimetype=mime or 'application/octet-stream',
+                  resumable=True,
+                  chunksize=4 * 1024 * 1024,
+              )
+              meta = {'name': fname, 'parents': [target_id]}
+              print(f'Uploading: {fname}')
+              file = drive.files().create(
+                  body=meta, media_body=media,
+                  fields='id, name, size, webViewLink, webContentLink'
+              ).execute()
+
+              try:
+                  drive.permissions().create(
+                      fileId=file['id'],
+                      body={'role': 'reader', 'type': 'anyone'},
+                      fields='id',
+                  ).execute()
+              except Exception as exc:
+                  print(f'::warning::Could not publish {fname}: {exc}', file=sys.stderr)
+
+              share_url = (
+                  file.get('webViewLink')
+                  or f"https://drive.google.com/file/d/{file['id']}/view"
+              )
+              results.append({
+                  'name': file.get('name', fname),
+                  'url': share_url,
+                  'id': file['id'],
+                  'size': file.get('size'),
+              })
+              print(f'Uploaded: {share_url}')
+
+          # See drive_uploader.yml for the rationale on this path. The
+          # OctoFetch File Manager only lists downloads/<folder>/..., so
+          # we keep the Drive manifest under .octofetch/drive/<folder>/
+          # to avoid surfacing an empty pseudo-folder in the GitHub view.
+          out_dir = os.path.join('.octofetch', 'drive', folder)
+          os.makedirs(out_dir, exist_ok=True)
+          with open(os.path.join(out_dir, 'links.json'), 'w', encoding='utf-8') as f:
+              json.dump({'destination': 'drive', 'files': results}, f, indent=2)
+          PY
+
+      - name: Commit links manifest
+        run: |
+          set -euo pipefail
+
+          git config user.name "OctoFetchBot"
+          git config user.email "bot@octofetch.local"
+          git config advice.updateSparsePath false
+
+          git add --sparse -- ".octofetch/drive/$FOLDER/links.json"
+          if git diff --cached --quiet; then
+            echo "No links.json staged."
+            exit 0
+          fi
+          git commit -m "YouTube→Drive: $FOLDER links manifest"
+
+          for attempt in 1 2 3 4 5; do
+            git fetch origin >/dev/null 2>&1 || true
+            git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)" >/dev/null 2>&1 || true
+            if git push; then
+              echo "Manifest pushed on attempt $attempt"
+              exit 0
+            fi
+            sleep $((attempt * 5))
+          done
+          echo "::error::Failed to push links.json after 5 attempts"
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf source_file .download_info 2>/dev/null || true

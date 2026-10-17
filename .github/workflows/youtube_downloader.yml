@@ -1,0 +1,499 @@
+# OctoFetch-YouTube-Version: 17
+
+name: 'YouTube Download Engine'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: 'YouTube video URL'
+        required: true
+        type: string
+      folder_name:
+        required: true
+        type: string
+      output_format:
+        description: 'mp4 or mp3'
+        required: false
+        type: string
+        default: 'mp4'
+      desired_quality:
+        description: 'Video quality (720p, 1080p) or audio bitrate (128kbps, 192kbps, 320kbps)'
+        required: false
+        type: string
+        default: '720p'
+      chunk_size:
+        required: false
+        type: string
+        default: "45M"
+      cookies:
+        description: 'Optional YouTube cookies in Netscape format, base64-encoded. Only needed for age-restricted, members-only or region-locked videos.'
+        required: false
+        type: string
+        default: ''
+      max_mb:
+        description: 'Refuse videos larger than this many MB. 0 means no limit.'
+        required: false
+        type: string
+        default: '0'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: yt-${{ github.event.inputs.folder_name }}
+  cancel-in-progress: false
+
+jobs:
+  youtube-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+
+      # Sparse + blob:none checkout. Node repos are loaded up with prior
+      # download chunks (.zip.NNN, potentially many GBs), so a normal
+      # `actions/checkout@v4` spends ~1m fetching blobs we never read.
+      # We only need a working git directory to commit + push new files;
+      # `filter: blob:none` skips downloading any existing blobs, and
+      # sparse-checkout limits the working tree to .github/.
+      - name: Checkout Repository (sparse, fast)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            .github
+          sparse-checkout-cone-mode: false
+
+      - name: Start PO-Token Provider (Docker)
+        run: |
+          docker run --name bgutil-provider -d --restart always -p 127.0.0.1:4416:4416 brainicism/bgutil-ytdlp-pot-provider
+          for i in {1..30}; do
+            if curl -s http://127.0.0.1:4416/ping >/dev/null 2>&1; then
+              echo "PO-Token Provider is ready."
+              break
+            fi
+            echo "Waiting for PO-Token Provider..."
+            sleep 1
+          done
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zip curl python3 python3-pip ffmpeg
+          pip3 install --quiet -U "yt-dlp[default]" yt-dlp-ejs bgutil-ytdlp-pot-provider
+          curl -fsSL https://deno.land/install.sh | sh
+          echo "$HOME/.deno/bin" >> $GITHUB_PATH
+
+      # Health check: fail here with a clear message if the tools are not usable,
+      # rather than partway through a download.
+      - name: Verify YouTube tools
+        run: |
+          set -e
+          export PATH="$HOME/.deno/bin:$PATH"
+          ffmpeg -version | head -n 1
+          deno --version || true
+          python3 -m yt_dlp --version
+          python3 -c "import yt_dlp; print('yt_dlp import ok')"
+          curl -s http://127.0.0.1:4416/ping || echo "Warning: POT provider ping failed"
+
+      - name: Download video
+        env:
+          INPUT_URL: ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT: ${{ github.event.inputs.output_format }}
+          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
+          INPUT_COOKIES: ${{ github.event.inputs.cookies }}
+          INPUT_MAX_MB: ${{ github.event.inputs.max_mb }}
+        run: |
+          python3 << 'EOF'
+          """Downloads a YouTube video using pure yt-dlp with PO-Token Provider.
+
+          Writes .download_info with:
+              line 1: the absolute path of the downloaded file
+              line 2: the file name
+              line 3: the title
+          """
+
+          import base64
+          import json
+          import os
+          import re
+          import shutil
+          import subprocess
+          import sys
+          import time
+
+          URL = os.environ.get("INPUT_URL", "").strip()
+          FMT = os.environ.get("INPUT_FORMAT", "mp4").strip().lower()
+          QUALITY = os.environ.get("INPUT_QUALITY", "720p").strip().lower()
+          COOKIES_B64 = os.environ.get("INPUT_COOKIES", "").strip()
+          CHUNK_LIMIT_MB = int(os.environ.get("INPUT_MAX_MB", "0") or 0)
+
+          cookies_file = None
+          clean_cookie_file = None
+          stripped_cookie_file = None
+
+          def die(message, detail=""):
+              for cf in (cookies_file, clean_cookie_file, stripped_cookie_file):
+                  if cf and os.path.exists(cf):
+                      try:
+                          os.remove(cf)
+                      except OSError:
+                          pass
+              print("Cleaned up temporary cookie files.")
+              if detail:
+                  print(f"::error::{message}")
+                  print(detail)
+              else:
+                  print(f"::error::{message}")
+              sys.exit(1)
+
+          def quality_height(raw):
+              m = re.search(r"(\d{3,4})", raw or "")
+              if not m:
+                  return 720
+              value = int(m.group(1))
+              for floor in (2160, 1440, 1080, 720, 480, 360, 240, 144):
+                  if value >= floor:
+                      return floor
+              return 144
+
+          def sanitize_cookie_file(src_path, dst_path, strip_rolling=False):
+              if not src_path or not os.path.exists(src_path):
+                  return False
+              with open(src_path, "r", encoding="utf-8", errors="replace") as fh:
+                  lines = fh.readlines()
+              out_lines = [
+                  "# Netscape HTTP Cookie File\n",
+                  "# https://curl.haxx.se/rfc/cookie_spec.html\n",
+                  "# This is a generated file! Do not edit.\n\n"
+              ]
+              kept = 0
+              for line in lines:
+                  s = line.strip()
+                  if not s or s.startswith("# Netscape") or s.startswith("# http") or s.startswith("# This is"):
+                      continue
+                  if s.startswith("#") and not s.startswith("#HttpOnly_"):
+                      continue
+                  parts = s.split("\t")
+                  if len(parts) < 7:
+                      parts = re.split(r"\s+", s)
+                  if len(parts) >= 7:
+                      cname = parts[5].strip()
+                      # If strip_rolling is True, eliminate volatile session tokens (*PSIDTS, *SIDCC)
+                      if strip_rolling and any(k in cname for k in ("PSIDTS", "SIDCC")):
+                          continue
+                      cleaned_row = "\t".join([p.strip() for p in parts[:6]] + ["\t".join(parts[6:]).strip()])
+                      out_lines.append(cleaned_row + "\n")
+                      kept += 1
+              if kept > 0:
+                  with open(dst_path, "w", encoding="utf-8", newline="\n") as fh:
+                      fh.writelines(out_lines)
+                  os.chmod(dst_path, 0o600)
+                  return True
+              return False
+
+          if COOKIES_B64:
+              try:
+                  raw = base64.b64decode(COOKIES_B64, validate=True).decode("utf-8")
+                  cookies_file = os.path.join(os.getcwd(), "yt_cookies.txt")
+                  with open(cookies_file, "w", encoding="utf-8", newline="\n") as fh:
+                      fh.write(raw if raw.endswith("\n") else raw + "\n")
+                  os.chmod(cookies_file, 0o600)
+                  clean_cookie_file = os.path.join(os.getcwd(), "yt_cookies_clean.txt")
+                  if sanitize_cookie_file(cookies_file, clean_cookie_file, strip_rolling=False):
+                      print("Validated and formatted YouTube cookies.")
+                  else:
+                      clean_cookie_file = cookies_file
+                      print("Using raw YouTube cookies.")
+              except Exception as exc:
+                  print(f"::warning::Cookies decode warning: {exc}")
+          else:
+              print("No YouTube cookies supplied via INPUT_COOKIES.")
+
+          if not URL:
+              die("No video URL was supplied.")
+
+          is_audio = FMT in ("mp3", "m4a", "opus", "wav")
+          height = quality_height(QUALITY)
+          final_ext = "mp3" if FMT == "mp3" else ("m4a" if is_audio else "mp4")
+
+          video_id = "video"
+          m = re.search(r"(?:v=|youtu\.be/|shorts/|embed/)([A-Za-z0-9_-]{11})", URL)
+          if m:
+              video_id = m.group(1)
+
+          print(f"Fetching: {URL}")
+          print(f"Format  : {'audio (' + final_ext + ')' if is_audio else 'video up to ' + str(height) + 'p'}")
+
+          if is_audio:
+              if FMT == "mp3":
+                  selector = "bestaudio/best"
+                  postprocess = ["--extract-audio", "--audio-format", "mp3"]
+              else:
+                  selector = f"bestaudio[ext={FMT}]/bestaudio/best"
+                  postprocess = []
+          else:
+              selector = (
+                  f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
+                  f"bestvideo[height<={height}]+bestaudio/"
+                  f"best[height<={height}]/"
+                  f"best"
+              )
+              postprocess = ["--merge-output-format", "mp4"]
+
+          def run_ytdlp(client_list, cookie_path=None):
+              c = [
+                  sys.executable, "-m", "yt_dlp",
+                  "--no-playlist",
+                  "--newline",
+                  "--retries", "5",
+                  "--fragment-retries", "5",
+                  "--socket-timeout", "30",
+                  "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+                  "--extractor-args", f"youtube:player_client={client_list}",
+                  "-f", selector,
+                  "-o", "download.%(ext)s",
+              ]
+              deno_bin = shutil.which("deno") or os.path.expanduser("~/.deno/bin/deno")
+              if isinstance(deno_bin, str) and os.path.exists(deno_bin):
+                  c += ["--js-runtimes", f"deno:{deno_bin}"]
+              else:
+                  c += ["--js-runtimes", "deno"]
+              c += ["--js-runtimes", "node", "--remote-components", "ejs:github"]
+              if cookie_path and os.path.exists(cookie_path):
+                  c += ["--cookies", cookie_path]
+              if postprocess:
+                  c += postprocess
+              c.append(URL)
+              res = subprocess.run(c, capture_output=True, text=True, encoding="utf-8", errors="replace")
+              if res.returncode != 0 and not has_downloaded():
+                  err_tail = "\n".join((res.stderr or "").splitlines()[-10:])
+                  out_tail = "\n".join((res.stdout or "").splitlines()[-10:])
+                  print(f"::warning::Client [{client_list}] (cookies={bool(cookie_path)}) failed (exit {res.returncode}):\n{err_tail}\n{out_tail}")
+              return res
+
+          def has_downloaded():
+              return any(
+                  f.startswith("download.") and os.path.getsize(f) > 0
+                  for f in os.listdir(".")
+              )
+
+          proc = None
+          # Strategy 1: Attempt with user cookies (web_embedded is proven to work without GVS PO-Token block)
+          if clean_cookie_file and os.path.exists(clean_cookie_file):
+              print("Attempting download with cookies (web_embedded, web_creator, mweb)...")
+              proc = run_ytdlp("web_embedded,web_creator,mweb", cookie_path=clean_cookie_file)
+              if proc.returncode != 0 and not has_downloaded():
+                  print("Retrying with cookies (android, ios)...")
+                  proc = run_ytdlp("android,ios", cookie_path=clean_cookie_file)
+
+              # Strategy 1b: If cookies failed due to rotation or challenge, auto-strip volatile tokens
+              if proc.returncode != 0 and not has_downloaded():
+                  stripped_cookie_file = os.path.join(os.getcwd(), "yt_cookies_stripped.txt")
+                  if sanitize_cookie_file(cookies_file, stripped_cookie_file, strip_rolling=True):
+                      print("Detected possible expired rolling tokens. Retrying with auto-repaired cookies...")
+                      proc = run_ytdlp("web_embedded,web_creator,mweb", cookie_path=stripped_cookie_file)
+                      if proc.returncode != 0 and not has_downloaded():
+                          proc = run_ytdlp("android,ios", cookie_path=stripped_cookie_file)
+
+          # Strategy 2: If cookies failed or weren't provided, seamlessly fallback to anonymous PO-Token
+          if (not proc or proc.returncode != 0) and not has_downloaded():
+              print("Cookie session challenged or no cookies. Running yt-dlp with PO-Token (web_embedded, web_creator)...")
+              proc = run_ytdlp("web_embedded,web_creator,mweb", cookie_path=None)
+
+          if (not proc or proc.returncode != 0) and not has_downloaded():
+              print("Retrying yt-dlp with PO-Token (android, ios)...")
+              proc = run_ytdlp("android,ios", cookie_path=None)
+
+          if (not proc or proc.returncode != 0) and not has_downloaded():
+              print("Retrying yt-dlp with PO-Token (tv, tv_embedded)...")
+              proc = run_ytdlp("tv,tv_embedded", cookie_path=None)
+
+          candidates = [
+              os.path.join(".", f) for f in os.listdir(".")
+              if f.startswith("download.") and os.path.getsize(f) > 0
+          ]
+          if not candidates:
+              err = (proc.stderr or "").strip() if proc else "No output from downloader"
+              tail = "\n".join(err.splitlines()[-14:])
+              if "Sign in to confirm you" in err or "confirm you are not a bot" in err:
+                  die("YouTube asked to confirm you are not a bot (HTTP 403).", tail)
+              if "Private video" in err:
+                  die("This video is private.", tail)
+              if "members-only" in err.lower() or "join this channel" in err.lower():
+                  die("This video is members-only. Supply valid YouTube cookies in Settings.", tail)
+              if "age-restricted" in err.lower() or "confirm your age" in err.lower():
+                  die("This video is age-restricted. Supply valid YouTube cookies in Settings.", tail)
+              if "403" in err:
+                  die("YouTube refused to serve the video stream (HTTP 403).", tail)
+              die("Downloader could not fetch this video.", tail)
+
+          path = max(candidates, key=os.path.getsize)
+          size_mb = os.path.getsize(path) / 1048576
+
+          if size_mb < 0.01:
+              die(f"The downloaded file is empty ({path}).")
+
+          if CHUNK_LIMIT_MB and size_mb > CHUNK_LIMIT_MB:
+              die(
+                  f"The video is {size_mb:.0f} MB, over the {CHUNK_LIMIT_MB} MB limit this "
+                  f"server allows. Choose a lower quality."
+              )
+
+          title = ""
+          try:
+              probe = subprocess.run(
+                  [sys.executable, "-m", "yt_dlp", "--no-playlist", "--no-warnings",
+                   "--js-runtimes", "deno", "--js-runtimes", "node", "--remote-components", "ejs:github",
+                   "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+                   "--extractor-args", "youtube:player_client=web_embedded,web_creator,mweb",
+                   "--skip-download", "--print", "%(title)s", URL],
+                  capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
+              if probe.returncode == 0 and probe.stdout.strip():
+                  title = probe.stdout.strip().splitlines()[0]
+          except Exception:
+              pass
+
+          if not title:
+              title = os.path.splitext(os.path.basename(path))[0]
+
+          suffix = f"{height}p" if not is_audio else final_ext
+          clean = re.sub(r"[^A-Za-z0-9\-_()\[\]]", "_", title.replace(" ", "_"))
+          clean = re.sub(r"_+", "_", clean).strip("_")[:70] or video_id
+          clean = clean.lstrip("-")
+          filename = f"{clean}_{video_id}_{suffix}.{final_ext}"
+
+          if os.path.exists(filename):
+              os.remove(filename)
+          os.rename(path, filename)
+          final = os.path.abspath(filename)
+
+          print(f"Downloaded: {filename} ({size_mb:.1f} MB)")
+
+          with open(".download_info", "w", encoding="utf-8") as fh:
+              fh.write(f"{final}\n{filename}\n{title}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"filename={filename}\n")
+              fh.write(f"title={title}\n")
+
+          if cookies_file and os.path.exists(cookies_file):
+              os.remove(cookies_file)
+              print("Removed the temporary cookie file.")
+          EOF
+
+      - name: Stage the file
+        run: |
+          set -euo pipefail
+          # .download_info holds: absolute path, file name, title.
+          FILE_PATH=$(head -1 .download_info)
+          FILENAME=$(sed -n '2p' .download_info)
+          if [ ! -s "$FILE_PATH" ]; then
+            echo "::error::Downloaded file is missing or empty: $FILE_PATH"
+            exit 1
+          fi
+          mkdir -p temp_download
+          mv "$FILE_PATH" "temp_download/$FILENAME"
+
+      - name: Split and organize
+        env:
+          FOLDER_INPUT: ${{ github.event.inputs.folder_name }}
+          CHUNK_SIZE: ${{ github.event.inputs.chunk_size }}
+        run: |
+          set -euo pipefail
+
+          FOLDER=$(printf '%s' "$FOLDER_INPUT" | tr -c 'A-Za-z0-9._-' '_')
+          [ ${#FOLDER} -gt 100 ] && FOLDER="${FOLDER:0:100}"
+          [ -z "$FOLDER" ] && FOLDER="YT_$(date +%Y%m%d%H%M%S)"
+          echo "FOLDER=$FOLDER" >> "$GITHUB_ENV"
+
+          FILENAME=$(ls temp_download/)
+          mkdir -p wrap_dir
+          mv "temp_download/$FILENAME" "wrap_dir/$FILENAME"
+          (
+            cd wrap_dir
+            zip -0 "../$FOLDER.zip" "$FILENAME"
+          )
+
+          mkdir -p "downloads/$FOLDER"
+          split -b "$CHUNK_SIZE" -d -a 3 "$FOLDER.zip" "downloads/$FOLDER/chunk_"
+
+          (
+            cd "downloads/$FOLDER"
+            a=1
+            for i in chunk_*; do
+              new=$(printf "%s.zip.%03d" "$FOLDER" "$a")
+              mv -- "$i" "$new"
+              a=$((a + 1))
+            done
+            sha256sum *.zip.* > checksums.sha256
+          )
+
+      - name: Commit and push
+        env:
+          BATCH_SIZE: 5
+        run: |
+          set -euo pipefail
+
+          git config user.name "OctoFetchBot"
+          git config user.email "bot@octofetch.local"
+          git config http.postBuffer 524288000
+          git config http.lowSpeedLimit 1000
+          git config http.lowSpeedTime 600
+
+          mapfile -t CHUNKS < <(ls "downloads/$FOLDER"/*.zip.* 2>/dev/null | sort)
+          ALL_FILES=( "${CHUNKS[@]}" "downloads/$FOLDER/checksums.sha256" )
+
+          TOTAL=${#ALL_FILES[@]}
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "Nothing to commit." >&2
+            exit 1
+          fi
+
+          push_with_retry() {
+            local label="$1"
+            for attempt in 1 2 3 4 5 6 7; do
+              git fetch origin >/dev/null 2>&1 || true
+              git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)" >/dev/null 2>&1 || true
+              if git push; then
+                echo "  OK $label pushed on attempt $attempt"
+                return 0
+              fi
+              backoff=$((attempt * 5))
+              echo "  retry in ${backoff}s ($label, attempt $attempt)..."
+              sleep "$backoff"
+            done
+            echo "  FAILED $label after 7 attempts" >&2
+            return 1
+          }
+
+          batch_n=0
+          for ((i=0; i<TOTAL; i+=BATCH_SIZE)); do
+            batch_n=$((batch_n + 1))
+            slice=( "${ALL_FILES[@]:i:BATCH_SIZE}" )
+            echo "Batch $batch_n: ${#slice[@]} file(s)"
+
+            # --sparse lets git stage paths outside the sparse-checkout cone.
+            # We sparse-checkout only .github above, but the downloads we just
+            # produced live under downloads/$FOLDER/ — those are new files
+            # (no blobs to fetch), so allowing them via --sparse is safe.
+            git add --sparse -- "${slice[@]}"
+            if git diff --cached --quiet; then
+              echo "  nothing staged for batch $batch_n, skipping."
+              continue
+            fi
+
+            git commit -m "Add $FOLDER (batch $batch_n)"
+            push_with_retry "batch $batch_n" || exit 1
+          done
+
+          echo "All batches pushed ($batch_n total)."
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf temp_download wrap_dir .download_info *.zip 2>/dev/null || true
